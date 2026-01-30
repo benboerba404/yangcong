@@ -1,0 +1,26 @@
+# 配置与敏感信息（勿提交密码）
+code/const.json
+code/jump_export_config.json
+*.local.json
+
+# 临时与导出数据
+code/临时需求数据/*
+!code/临时需求数据/.gitkeep
+
+# 编辑器与工具（按需取消注释）
+.cursor/
+code/.claude/
+# *.code-workspace
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.local
+
+# 系统
+.DS_Store
+Thumbs.db
