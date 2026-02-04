@@ -1,25 +1,3 @@
--- =====================================================
--- 用户活跃日表 dws.topic_user_active_detail_day
--- =====================================================
--- 核心概念说明：
--- 
--- 【活跃层级】（门槛从低到高）
---   1. 活跃用户(is_active_user=1)：打开APP即算活跃
---   2. 学习活跃用户(is_learn_active_user=1)：触发知识点完成页（来源：dw.fact_user_learn_active_detail_day）
---      - 仅看视频退出不算学习活跃
---
--- 【服务期归属】(user_allocation)
---   - 电销服务期：数组包含"电销"（如["电销/网销"]）
---   - 非电销服务期：不含"电销"（如["体验营"]、["入校"]、["新媒体视频"]）
---   - 无服务期：NULL或空数组
---
--- 【在库 vs 电销服务期】（两个不同概念）
---   - 在库(is_clue_seat=1)：活跃日在 clue_info.created_at ~ clue_expire_time 之间
---   - 电销服务期：被电销触达（领取）后进入的服务期，时长与线索来源有关
---     · 判断：user_allocation 包含"电销"
---   - 关系：在库 → 一定在电销服务期；在电销服务期 → 不一定在库（线索可能已过期但服务期未结束）
--- =====================================================
-
 CREATE EXTERNAL TABLE `dws`.`topic_user_active_detail_day` (
   `user_sk` int COMMENT '用户代理键',
   `u_user` string COMMENT '用户id',
@@ -71,8 +49,8 @@ CREATE EXTERNAL TABLE `dws`.`topic_user_active_detail_day` (
   `client_os` string COMMENT '用户活跃的os',
   `product_id` string COMMENT '产品ID',
   `download_channel` string COMMENT '下载渠道',
-  `is_learn_active_user` smallint COMMENT '是否学习活跃用户。来源：dw.fact_user_learn_active_detail_day。判断逻辑：用户触发知识点完成页才算学习活跃，仅看视频退出不计入',
-  `is_active_user` smallint COMMENT '是否活跃用户。判断逻辑：打开APP即算活跃，门槛低于学习活跃',
+  `is_learn_active_user` smallint COMMENT '是否学习活跃用户',
+  `is_active_user` smallint COMMENT '是否活跃用户',
   `learn_active_cnt` int COMMENT '学习活跃次数',
   `active_cnt` int COMMENT '活跃次数',
   `topic_finish_cnt` int COMMENT '完成知识点数',
@@ -136,7 +114,7 @@ CREATE EXTERNAL TABLE `dws`.`topic_user_active_detail_day` (
   `enter_pad_scene_finaltreat_user_sk` int COMMENT 'pad体检表进入用户user_sk',
   `finsh_pad_scene_finaltreat_user_sk` int COMMENT 'pad体检表有效学习用户user_sk',
   `sn_code` string COMMENT 'sn_code',
-  `user_allocation` array < string > COMMENT '用户全域服务期，枚举值：电销/网销、体验营、入校、新媒体视频。包含"电销"为电销服务期，其他为非电销服务期，NULL为无服务期',
+  `user_allocation` array < string > COMMENT '用户全域服务期',
   `business_user_pay_status_statistics` string COMMENT '新增(统计日期当天注册的)、大会员付费用户(统计日期之前买过大会员商品)、续费用户(统计日期之前买过正价课)、老未(统计日期之前注册的)',
   `regist_user_allocation` array < string > COMMENT '用户注册当天服务期归属',
   `user_vip_tag` string COMMENT '会员身份标签',
