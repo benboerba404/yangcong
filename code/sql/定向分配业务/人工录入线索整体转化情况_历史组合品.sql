@@ -21,7 +21,7 @@ with t1 as
     order_id,
     amount
   from aws.crm_order_info
-  where substr(pay_time, 1, 10) <= '2026-01-29'
+  where substr(pay_time, 1, 10) <= '2026-02-10'
     and worker_id <> 0
     and in_salary = 1
     and is_test = false
@@ -39,7 +39,7 @@ with t1 as
   left join dw.fact_call_history a 
   on t1.user_id = a.user_id and a.created_at >= t1.created_at
   where a.user_id is not null
-  and substr(a.created_at, 1, 10) between '2026-01-21' and '2026-01-29'
+  and substr(a.created_at, 1, 10) between '2026-01-21' and '2026-02-10'
   group by t1.user_id
 )
 /** 分配量、外呼量、外呼次数、接通量、有效接通量、转化量、转化金额 */
