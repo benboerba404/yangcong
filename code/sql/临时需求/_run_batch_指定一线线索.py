@@ -95,7 +95,7 @@ substr(t1.created_at,1,19) created_at
 ,substr(pay_time,1,19) pay_time
 ,order_id
 ,amount
-,t2.worker_name
+,t2.worker_name as worker_name_2
 from t1
 left join t2 on t1.user_id = t2.user_id  and t1.created_at < t2.pay_time
 left join dw.dim_crm_organization d0 on t1.workplace_id = d0.id

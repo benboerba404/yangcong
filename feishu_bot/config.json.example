@@ -1,0 +1,34 @@
+{
+  "feishu": {
+    "app_id": "cli_xxxxxxxxxx",
+    "app_secret": "请填写飞书应用的 App Secret"
+  },
+
+  "llm": {
+    "_说明": "provider 二选一: anthropic (Claude) 或 openai_compatible (DeepSeek等)",
+
+    "provider": "anthropic",
+    "api_key": "sk-ant-xxxxxxxxxxxxxxxx",
+    "model": "claude-sonnet-4-20250514",
+
+    "_provider_deekseek示例": "openai_compatible",
+    "_base_url_deepseek示例": "https://api.deepseek.com",
+    "_model_deepseek示例": "deepseek-chat"
+  },
+
+  "database": {
+    "ssh_host": "跳板机IP",
+    "ssh_user": "SSH用户名",
+    "ssh_password": "SSH密码",
+    "db_host": "10.17.2.45",
+    "db_port": 10010,
+    "db_user": "数据库用户名",
+    "db_password": "数据库密码",
+    "database": "tmp"
+  },
+
+  "knowledge_dir": "../.cursor/knowledge",
+  "table_schema_dir": "../code/sql/表结构",
+  "output_dir": "../output",
+  "data_threshold": 20
+}
