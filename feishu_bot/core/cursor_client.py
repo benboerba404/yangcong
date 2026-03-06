@@ -150,7 +150,7 @@ class CursorClient:
             f.write(prompt)
 
         cmd = self._build_cmd()
-        cmd.extend(["-p", "--output-format", "text", "--trust", "--mode", "agent"])
+        cmd.extend(["-p", "--output-format", "text", "--trust", "--mode", "ask"])
 
         if self.workspace:
             cmd.extend(["--workspace", self.workspace])

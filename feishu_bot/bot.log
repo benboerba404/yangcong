@@ -1,0 +1,9 @@
+C:\Users\yangcong\AppData\Local\Programs\Python\Python39\lib\site-packages\paramiko\pkey.py:82: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from cryptography.hazmat.primitives.ciphers.algorithms in 48.0.0.
+  "cipher": algorithms.TripleDES,
+C:\Users\yangcong\AppData\Local\Programs\Python\Python39\lib\site-packages\paramiko\transport.py:253: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from cryptography.hazmat.primitives.ciphers.algorithms in 48.0.0.
+  "class": algorithms.TripleDES,
+12:12:41 [core.cursor_client] INFO: Cursor CLI 路径: C:\Users\yangcong\AppData\Local\cursor-agent\agent.CMD
+12:12:41 [main] INFO: 正在连接飞书长连接...
+[Lark] [2026-03-06 12:12:42,256] [INFO] connected to wss://msg-frontier.feishu.cn/ws/v2?fpid=493&aid=552564&device_id=7613990730298346456&access_key=d4e15e40a5e094857ab2d1886fcf3500&service_id=33554678&ticket=dc7c944a-6c9d-4a80-859e-aab208712fc2 [conn_id=7613990730298346456]
+12:12:42 [Lark] INFO: connected to wss://msg-frontier.feishu.cn/ws/v2?fpid=493&aid=552564&device_id=7613990730298346456&access_key=d4e15e40a5e094857ab2d1886fcf3500&service_id=33554678&ticket=dc7c944a-6c9d-4a80-859e-aab208712fc2 [conn_id=7613990730298346456]
+12:16:39 [main] INFO: 收到消息 [user=ou_610317396edfedf4fd240e50a07faf5a]: 确认
