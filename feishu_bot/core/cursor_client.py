@@ -16,9 +16,27 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class ProcRef:
+    """跨线程持有子进程引用，供外部随时 kill。"""
+
+    __slots__ = ("proc",)
+
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+
+    def kill(self):
+        p = self.proc
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
 
 
 def _find_agent_cmd() -> str:
@@ -65,6 +83,7 @@ class CursorClient:
         user_message: str,
         history: Optional[List[dict]] = None,
         on_progress: Optional[Callable[[str], None]] = None,
+        proc_ref: Optional["ProcRef"] = None,
     ) -> dict:
         """调用 Cursor 无头模式生成 SQL，失败自动重试最多 2 次。"""
         prompt = self._build_prompt(user_message, history)
@@ -72,7 +91,7 @@ class CursorClient:
         last_err = None
         for attempt in range(1, 3):
             try:
-                output = self._call_cursor(prompt, on_progress)
+                output = self._call_cursor(prompt, on_progress, proc_ref)
                 result = _extract_json(output)
                 logger.info("Cursor 返回: %s", result.get("understanding", ""))
                 return result
@@ -115,13 +134,21 @@ class CursorClient:
 
     # ── CLI 调用（流式） ──────────────────────────────────
 
-    def _call_cursor(self, prompt: str, on_progress: Optional[Callable] = None) -> str:
-        prompt_file = os.path.join(self.workspace, ".cursor", "_prompt_tmp.md") if self.workspace else None
-        if not prompt_file:
+    def _call_cursor(
+        self,
+        prompt: str,
+        on_progress: Optional[Callable] = None,
+        proc_ref: Optional["ProcRef"] = None,
+    ) -> str:
+        # 每次请求使用唯一文件名，防止并发请求互相覆盖
+        unique_id = uuid.uuid4().hex[:8]
+        if self.workspace:
+            prompt_file = os.path.join(self.workspace, ".cursor", f"_prompt_{unique_id}.md")
+        else:
             import tempfile
-            prompt_file = os.path.join(tempfile.gettempdir(), "cursor_prompt.md")
+            prompt_file = os.path.join(tempfile.gettempdir(), f"cursor_prompt_{unique_id}.md")
         try:
-            return self._call_cursor_streaming(prompt, prompt_file, on_progress)
+            return self._call_cursor_streaming(prompt, prompt_file, on_progress, proc_ref)
         finally:
             try:
                 os.unlink(prompt_file)
@@ -144,6 +171,7 @@ class CursorClient:
         prompt: str,
         prompt_file: str,
         on_progress: Optional[Callable] = None,
+        proc_ref: Optional["ProcRef"] = None,
     ) -> str:
         os.makedirs(os.path.dirname(prompt_file), exist_ok=True)
         with open(prompt_file, "w", encoding="utf-8") as f:
@@ -174,6 +202,8 @@ class CursorClient:
             env=env,
             cwd=self.workspace or None,
         )
+        if proc_ref is not None:
+            proc_ref.proc = proc
 
         output_chunks: list[str] = []
         last_activity = time.time()

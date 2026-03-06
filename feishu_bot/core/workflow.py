@@ -2,12 +2,14 @@
 """
 工作流编排：管理会话状态，串联 LLM → SQL 执行 → 结果返回 的完整链路。
 
-优化点：
-  - SQL 生成期间并行预热 SSH 隧道，执行阶段省去 3-5s 建连时间
-  - 流式进度反馈：Cursor CLI 有输出就通知用户，减少等待焦虑
-  - 减少重复消息：合并状态提示
+核心机制：
+  - 请求版本号(req_id)：每个请求有唯一 ID，所有异步操作（发消息、改状态）前
+    先检查自己是否仍为当前请求，过期则静默退出，防止旧线程干扰新请求。
+  - 状态机：generating → wait_confirm → executing（期间拦截一切非取消操作）
+  - SSH 隧道预热：SQL 生成期间并行建连，执行阶段省去 3-5s
+  - 心跳：每 20 秒告知用户仍在处理
 
-两种模式（可全局切换）：
+两种模式：
   - 审查模式（默认）：生成 SQL → 展示给用户确认 → 确认后执行
   - 快速模式：生成 SQL 后直接执行，跳过确认
 """
@@ -19,13 +21,14 @@ import time
 from typing import Dict
 
 from .feishu_client import FeishuClient
-from .cursor_client import CursorClient
+from .cursor_client import CursorClient, ProcRef
 from .sql_executor import SQLExecutor
 
 logger = logging.getLogger(__name__)
 
 CONFIRM_KEYWORDS = {"确认", "执行", "跑", "ok", "OK", "可以", "没问题", "对", "yes", "Yes", "好"}
 CANCEL_KEYWORDS  = {"取消", "算了", "不用了", "放弃"}
+RESET_KEYWORDS   = {"重置", "重新开始", "清空", "新查询", "重新查询", "reset"}
 HELP_KEYWORDS    = {"帮助", "help", "用法", "使用说明"}
 FAST_PREFIXES    = ("直接跑", "直接执行", "直接出数", "跳过确认")
 MODIFY_PREFIXES  = ("修改", "改一下", "帮我改", "修改意见", "修改建议", "调整", "需要改")
@@ -52,6 +55,8 @@ HELP_TEXT = """\
 【单次跳过确认】加前缀，仅此次跳过：
   「直接跑：上个月各团队的营收」
 
+【重置】遇到状态混乱时，发送「重置」清空当前会话状态。
+
 数据 ≤20行直接展示，>20行生成 Excel 文件发给你。"""
 
 
@@ -70,13 +75,42 @@ class Workflow:
         self.data_threshold = config.get("data_threshold", 20)
         self.sessions: Dict[str, dict] = {}
         self.fast_mode_users: Dict[str, bool] = {}
+        self._req_seq = 0
 
-        self._progress_interval = 15
+    # ── 请求版本号 ─────────────────────────────────────────
+
+    def _next_req_id(self) -> int:
+        self._req_seq += 1
+        return self._req_seq
+
+    def _is_current(self, user_id: str, req_id: int) -> bool:
+        """检查 req_id 是否仍为该用户当前活跃请求。"""
+        s = self.sessions.get(user_id)
+        return s is not None and s.get("req_id") == req_id
+
+    def _send_guarded(self, user_id: str, req_id: int, chat_id: str, text: str) -> bool:
+        """仅当请求仍为当前请求时才发送消息，否则静默跳过。"""
+        if not self._is_current(user_id, req_id):
+            logger.info("请求 #%d 已过期 [user=%s]，跳过消息发送", req_id, user_id)
+            return False
+        self.feishu.send_text(chat_id, text)
+        return True
+
+    def _send_file_guarded(self, user_id: str, req_id: int, chat_id: str,
+                           filepath: str, filename: str) -> bool:
+        if not self._is_current(user_id, req_id):
+            return False
+        self.feishu.send_file(chat_id, filepath, filename)
+        return True
 
     # ── 主入口 ────────────────────────────────────────────
 
     def handle_message(self, user_id: str, chat_id: str, message_id: str, text: str):
         text = text.strip()
+
+        if text in RESET_KEYWORDS:
+            self._force_reset(user_id, chat_id)
+            return
 
         if text in HELP_KEYWORDS:
             self.feishu.send_text(chat_id, HELP_TEXT)
@@ -98,17 +132,37 @@ class Workflow:
 
         if session:
             state = session.get("state")
+            if state in ("generating", "modifying"):
+                if text in CANCEL_KEYWORDS:
+                    self._force_reset(user_id, chat_id)
+                else:
+                    action = "生成" if state == "generating" else "修改"
+                    self.feishu.send_text(
+                        chat_id,
+                        f"⏳ 正在{action} SQL 中，请稍候...\n发送「取消」或「重置」可中止。")
+                return
             if state == "executing":
-                self.feishu.send_text(chat_id, "⏳ SQL 正在执行中，请稍候，不要重复发送...")
+                if text in CANCEL_KEYWORDS:
+                    self.feishu.send_text(chat_id,
+                        "⏳ SQL 正在数据库执行中，无法中断，请等待完成...")
+                else:
+                    self.feishu.send_text(chat_id,
+                        "⏳ SQL 正在执行中，请稍候，不要重复发送...")
                 return
             if state == "wait_confirm":
                 if text in CANCEL_KEYWORDS:
                     self._cancel(user_id, chat_id)
-                elif text in CONFIRM_KEYWORDS:
+                    return
+                if text in CONFIRM_KEYWORDS:
                     self._execute(user_id, chat_id, session)
-                else:
+                    return
+                if text.startswith(MODIFY_PREFIXES) or len(text) <= 20:
                     self._modify(user_id, chat_id, text, session)
-                return
+                    return
+                # 较长文本视为全新需求，自动清掉旧 session
+                self.sessions.pop(user_id, None)
+                logger.info("wait_confirm 状态收到新需求，自动重置 [user=%s]", user_id)
+                # 继续往下走，作为新需求处理
 
         if text in CONFIRM_KEYWORDS:
             self.feishu.send_text(chat_id, "⚠️ 没有待确认的查询，请直接发送数据需求。")
@@ -137,157 +191,280 @@ class Workflow:
     # ── 快速模式 ──────────────────────────────────────────
 
     def _fast_mode(self, user_id: str, chat_id: str, text: str):
-        self.feishu.send_text(chat_id, "⏳ 正在生成并执行查询...")
+        prev_history = self.sessions.get(user_id, {}).get("history")
 
-        # 并行预热 SSH 隧道（SQL 生成期间提前建连）
+        req_id = self._next_req_id()
+        stop_event = threading.Event()
+        proc_ref = ProcRef()
+        self.sessions[user_id] = {
+            "req_id": req_id, "state": "generating", "chat_id": chat_id,
+            "stop_event": stop_event, "proc_ref": proc_ref,
+        }
+        self.feishu.send_text(chat_id, "⏳ 正在生成并执行查询...\n发送「取消」可中止。")
+
         tunnel_thread = threading.Thread(target=self._safe_ensure_tunnel, daemon=True)
         tunnel_thread.start()
 
-        history = self.sessions.get(user_id, {}).get("history")
+        history = prev_history
         if history:
             history = list(history) + [{"role": "user", "content": text}]
 
-        progress_cb = self._make_progress_callback(chat_id)
-        result = self.cursor_client.generate_sql(text, history, on_progress=progress_cb)
+        self._start_heartbeat(user_id, req_id, chat_id, stop_event)
+
+        try:
+            result = self.cursor_client.generate_sql(text, history, proc_ref=proc_ref)
+        finally:
+            stop_event.set()
+
+        if not self._is_current(user_id, req_id):
+            logger.info("快速模式请求 #%d 已过期，放弃", req_id)
+            return
 
         if not result.get("sql"):
+            self.sessions.pop(user_id, None)
             msg = result.get("understanding", "需求理解失败，请更详细地描述您的数据需求。")
             self.feishu.send_text(chat_id, f"❓ {msg}")
             return
 
-        prev_history = history or []
-        new_history = prev_history if history else [{"role": "user", "content": text}]
-        new_history = new_history + [
+        new_history = (history or [{"role": "user", "content": text}]) + [
             {"role": "assistant", "content": json.dumps(result, ensure_ascii=False)}
         ]
-        self.sessions[user_id] = {"state": "done", "history": new_history[-12:]}
+        self.sessions[user_id] = {
+            "req_id": req_id, "state": "executing", "chat_id": chat_id,
+            "history": new_history[-12:],
+        }
 
-        # 等待隧道预热完成
         tunnel_thread.join(timeout=10)
 
-        logger.info("快速模式 SQL 生成完成，直接执行")
-        self._run_and_reply(chat_id, result["sql"], result.get("filename", "查询结果.xlsx"))
+        logger.info("快速模式 #%d SQL 生成完成，直接执行", req_id)
+        success = self._run_and_reply(user_id, req_id, chat_id,
+                                      result["sql"], result.get("filename", "查询结果.xlsx"))
+
+        if not self._is_current(user_id, req_id):
+            return
+        if success:
+            self.sessions[user_id] = {
+                "req_id": req_id, "state": "done", "chat_id": chat_id,
+                "history": new_history[-12:],
+            }
+        else:
+            self.sessions.pop(user_id, None)
 
     # ── 审查模式 ──────────────────────────────────────────
 
     def _review_mode(self, user_id: str, chat_id: str, text: str):
-        self.feishu.send_text(chat_id, "⏳ 正在生成 SQL，请稍候...")
+        prev_history = self.sessions.get(user_id, {}).get("history")
 
-        # 审查模式也预热隧道，这样确认后执行更快
+        req_id = self._next_req_id()
+        stop_event = threading.Event()
+        proc_ref = ProcRef()
+        self.sessions[user_id] = {
+            "req_id": req_id, "state": "generating", "chat_id": chat_id,
+            "stop_event": stop_event, "proc_ref": proc_ref,
+        }
+        self.feishu.send_text(chat_id, "⏳ 正在生成 SQL，请稍候...\n发送「取消」可中止。")
+
         tunnel_thread = threading.Thread(target=self._safe_ensure_tunnel, daemon=True)
         tunnel_thread.start()
 
-        progress_cb = self._make_progress_callback(chat_id)
-        result = self.cursor_client.generate_sql(text, on_progress=progress_cb)
+        history = None
+        if prev_history:
+            history = list(prev_history) + [{"role": "user", "content": text}]
+
+        self._start_heartbeat(user_id, req_id, chat_id, stop_event)
+
+        try:
+            result = self.cursor_client.generate_sql(text, history=history, proc_ref=proc_ref)
+        finally:
+            stop_event.set()
+
+        if not self._is_current(user_id, req_id):
+            logger.info("审查模式请求 #%d 已过期，放弃", req_id)
+            return
 
         if not result.get("sql"):
+            self.sessions.pop(user_id, None)
             msg = result.get("understanding", "需求理解失败，请更详细地描述您的数据需求。")
             self.feishu.send_text(chat_id, f"❓ {msg}")
             return
 
+        new_history = (history or [{"role": "user", "content": text}]) + [
+            {"role": "assistant", "content": json.dumps(result, ensure_ascii=False)},
+        ]
         self.sessions[user_id] = {
+            "req_id":        req_id,
             "state":         "wait_confirm",
             "chat_id":       chat_id,
             "sql":           result["sql"],
             "filename":      result.get("filename", "查询结果.xlsx"),
             "output_fields": result.get("output_fields", []),
-            "history": [
-                {"role": "user",      "content": text},
-                {"role": "assistant", "content": json.dumps(result, ensure_ascii=False)},
-            ],
+            "history":       new_history[-12:],
         }
         self._send_confirmation(chat_id, result)
 
     # ── 修改（审查模式内）────────────────────────────────
 
     def _modify(self, user_id: str, chat_id: str, text: str, session: dict):
-        self.feishu.send_text(chat_id, "⏳ 正在修改 SQL...")
+        req_id = self._next_req_id()
+        stop_event = threading.Event()
+        proc_ref = ProcRef()
 
-        history = list(session.get("history", []))
-        history.append({"role": "user", "content": text})
+        old_sql = session.get("sql", "")
+        old_filename = session.get("filename", "查询结果.xlsx")
+        old_history = list(session.get("history", []))
 
-        result = self.cursor_client.generate_sql(text, history)
+        session.update({
+            "req_id": req_id, "state": "modifying",
+            "stop_event": stop_event, "proc_ref": proc_ref,
+        })
+        self.feishu.send_text(chat_id, "⏳ 正在修改 SQL...\n发送「取消」可中止。")
+
+        history = old_history + [{"role": "user", "content": text}]
+
+        self._start_heartbeat(user_id, req_id, chat_id, stop_event)
+
+        try:
+            result = self.cursor_client.generate_sql(text, history, proc_ref=proc_ref)
+        finally:
+            stop_event.set()
+
+        if not self._is_current(user_id, req_id):
+            logger.info("修改请求 #%d 已过期，放弃", req_id)
+            return
 
         if not result.get("sql"):
-            self.feishu.send_text(chat_id, f"❓ {result.get('understanding', '修改失败，请再描述一下。')}")
+            session.update({
+                "req_id": req_id, "state": "wait_confirm",
+                "sql": old_sql, "filename": old_filename, "history": old_history,
+            })
+            self.feishu.send_text(
+                chat_id,
+                f"❓ {result.get('understanding', '修改失败，请再描述一下。')}\n\n"
+                "可回复「确认」执行上一版 SQL，或重新描述修改意见。")
             return
 
         history.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
         session.update({
-            "sql":          result["sql"],
-            "filename":     result.get("filename", session.get("filename")),
+            "req_id":        req_id,
+            "state":         "wait_confirm",
+            "sql":           result["sql"],
+            "filename":      result.get("filename", old_filename),
             "output_fields": result.get("output_fields", []),
-            "history":      history,
+            "history":       history,
         })
         self._send_confirmation(chat_id, result, modified=True)
 
     # ── 确认执行（审查模式内）────────────────────────────
 
     def _execute(self, user_id: str, chat_id: str, session: dict):
+        req_id = session.get("req_id", -1)
         session["state"] = "executing"
-        success = self._run_and_reply(chat_id, session["sql"], session.get("filename", "查询结果.xlsx"))
+        sql = session["sql"]
+        filename = session.get("filename", "查询结果.xlsx")
+
+        success = self._run_and_reply(user_id, req_id, chat_id, sql, filename)
+
+        if not self._is_current(user_id, req_id):
+            return
         if success:
-            self.sessions.pop(user_id, None)
+            # 保留历史，支持多轮对话（"帮我改一下刚才的逻辑"）
+            self.sessions[user_id] = {
+                "req_id": req_id, "state": "done",
+                "chat_id": chat_id,
+                "history": session.get("history", [])[-12:],
+            }
         else:
             session["state"] = "wait_confirm"
 
-    # ── 取消 ─────────────────────────────────────────────
+    # ── 取消 / 强制重置 ─────────────────────────────────
 
     def _cancel(self, user_id: str, chat_id: str):
         self.sessions.pop(user_id, None)
         self.feishu.send_text(chat_id, "✅ 已取消。")
 
+    def _force_reset(self, user_id: str, chat_id: str):
+        """强制重置：立即终止所有进行中的操作并清空 session。"""
+        session = self.sessions.pop(user_id, None)
+        if session:
+            evt = session.get("stop_event")
+            if evt:
+                evt.set()
+            ref = session.get("proc_ref")
+            if ref:
+                ref.kill()
+        self.feishu.send_text(chat_id, "✅ 已重置，请直接发送新的数据需求。")
+
     # ── SQL 执行 + 结果返回 ──────────────────────────────
 
-    def _run_and_reply(self, chat_id: str, sql: str, filename: str) -> bool:
-        self.feishu.send_text(chat_id, "⏳ 正在执行 SQL...")
+    def _run_and_reply(self, user_id: str, req_id: int,
+                       chat_id: str, sql: str, filename: str) -> bool:
+        sql_preview = sql.strip()[:120].replace("\n", " ")
+        if len(sql.strip()) > 120:
+            sql_preview += "..."
+        if not self._send_guarded(user_id, req_id, chat_id,
+                                  f"⏳ 正在执行 SQL...\n{sql_preview}"):
+            return False
+
         try:
             df = self.executor.execute(sql)
         except Exception as e:
             logger.exception("SQL 执行失败")
-            self.feishu.send_text(chat_id, f"❌ SQL 执行失败：{e}\n\n请回复「确认」重试，或直接描述修改意见。")
+            self._send_guarded(
+                user_id, req_id, chat_id,
+                f"❌ SQL 执行失败：{e}\n\n请回复「确认」重试，或直接描述修改意见。")
+            return False
+
+        if not self._is_current(user_id, req_id):
+            logger.info("请求 #%d 已过期，丢弃查询结果", req_id)
             return False
 
         row_count = len(df)
 
         if row_count == 0:
-            self.feishu.send_text(chat_id, "⚠️ 查询结果为空，请检查筛选条件是否过严。")
+            self._send_guarded(user_id, req_id, chat_id,
+                               "⚠️ 查询结果为空，请检查筛选条件是否过严。")
         elif row_count <= self.data_threshold:
             table_text = df.to_csv(sep="\t", index=False)
-            msg = f"✅ 查询完成，共 {row_count} 行\n\n{table_text}\n\n（可直接复制粘贴到 Excel）"
-            self.feishu.send_text(chat_id, msg)
+            self._send_guarded(
+                user_id, req_id, chat_id,
+                f"✅ 查询完成，共 {row_count} 行\n\n{table_text}\n\n（可直接复制粘贴到 Excel）")
         else:
             os.makedirs(self.output_dir, exist_ok=True)
             filepath = os.path.join(self.output_dir, filename)
             df.to_excel(filepath, index=False, engine="openpyxl")
-            self.feishu.send_text(chat_id, f"✅ 查询完成，共 {row_count} 行，正在上传文件...")
-            self.feishu.send_file(chat_id, filepath, filename)
+            self._send_guarded(
+                user_id, req_id, chat_id,
+                f"✅ 查询完成，共 {row_count} 行，正在上传文件...")
+            self._send_file_guarded(user_id, req_id, chat_id, filepath, filename)
         return True
 
     # ── 辅助 ─────────────────────────────────────────────
 
     def _safe_ensure_tunnel(self):
-        """安全预热 SSH 隧道，不抛异常（后台线程调用）。"""
         try:
             self.executor.ensure_tunnel()
         except Exception as e:
             logger.warning("SSH 隧道预热失败（不影响后续重试）: %s", e)
 
-    def _make_progress_callback(self, chat_id: str):
+    def _start_heartbeat(self, user_id: str, req_id: int,
+                         chat_id: str, stop_event: threading.Event):
         """
-        创建节流进度回调：每 _progress_interval 秒最多发一次进度消息，
-        避免刷屏又让用户知道还在处理。
+        后台心跳：每 20 秒发一次进度提示。
+        当 stop_event 被设置或 req_id 不再是当前请求时自动停止。
         """
-        state = {"last_notify": time.time(), "notified": False}
+        start_ts = time.time()
+        interval = 20
 
-        def _cb(line: str):
-            now = time.time()
-            if now - state["last_notify"] >= self._progress_interval and not state["notified"]:
-                self.feishu.send_text(chat_id, "⏳ Cursor 仍在处理中...")
-                state["last_notify"] = now
-                state["notified"] = True
+        def _run():
+            while not stop_event.wait(timeout=interval):
+                if not self._is_current(user_id, req_id):
+                    break
+                elapsed = int(time.time() - start_ts)
+                self._send_guarded(
+                    user_id, req_id, chat_id,
+                    f"⏳ Cursor 仍在处理中...（已等待约 {elapsed} 秒）\n发送「取消」可中止。")
 
-        return _cb
+        threading.Thread(target=_run, daemon=True).start()
 
     def _send_confirmation(self, chat_id: str, result: dict, modified: bool = False):
         title  = "📋 SQL（已修改）" if modified else "📋 SQL 预览"
