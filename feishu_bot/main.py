@@ -18,9 +18,11 @@ for _proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
+import atexit
 import json
 import logging
 import re
+import signal
 import sys
 import threading
 from collections import OrderedDict
@@ -30,7 +32,7 @@ from lark_oapi import EventDispatcherHandler, ws, LogLevel
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
 from core.feishu_client import FeishuClient
-from core.llm_client import LLMClient
+from core.cursor_client import CursorClient
 from core.sql_executor import SQLExecutor
 from core.workflow import Workflow
 
@@ -72,20 +74,29 @@ def main():
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    for key in ("knowledge_dir", "table_schema_dir", "output_dir"):
-        if key in config and not os.path.isabs(config[key]):
-            config[key] = os.path.normpath(os.path.join(base_dir, config[key]))
+    if "output_dir" in config and not os.path.isabs(config["output_dir"]):
+        config["output_dir"] = os.path.normpath(os.path.join(base_dir, config["output_dir"]))
 
     # ── 初始化组件 ────────────────────────────────────────
     feishu_cfg = config["feishu"]
     feishu_client = FeishuClient(feishu_cfg["app_id"], feishu_cfg["app_secret"])
 
-    llm_client = LLMClient(config["llm"])
-    llm_client.load_knowledge(config["knowledge_dir"], config["table_schema_dir"])
+    cursor_cfg = config.get("cursor", {})
+    if not cursor_cfg.get("workspace"):
+        cursor_cfg["workspace"] = os.path.normpath(os.path.join(base_dir, ".."))
+    elif not os.path.isabs(cursor_cfg["workspace"]):
+        cursor_cfg["workspace"] = os.path.normpath(os.path.join(base_dir, cursor_cfg["workspace"]))
+    cursor_client = CursorClient(cursor_cfg)
 
     sql_executor = SQLExecutor(config["database"])
 
-    workflow = Workflow(feishu_client, llm_client, sql_executor, config)
+    workflow = Workflow(feishu_client, cursor_client, sql_executor, config)
+
+    def _cleanup():
+        logger.info("正在关闭 SSH 隧道...")
+        sql_executor.close()
+
+    atexit.register(_cleanup)
 
     dedup = EventDedup()
 

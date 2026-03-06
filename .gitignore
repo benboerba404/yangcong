@@ -3,6 +3,9 @@ code/const.json
 code/jump_export_config.json
 *.local.json
 
+# 日志
+logs/
+
 # 临时与导出数据
 code/临时需求数据/*
 !code/临时需求数据/.gitkeep

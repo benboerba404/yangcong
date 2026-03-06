@@ -2,22 +2,24 @@
 """
 工作流编排：管理会话状态，串联 LLM → SQL 执行 → 结果返回 的完整链路。
 
+优化点：
+  - SQL 生成期间并行预热 SSH 隧道，执行阶段省去 3-5s 建连时间
+  - 流式进度反馈：Cursor CLI 有输出就通知用户，减少等待焦虑
+  - 减少重复消息：合并状态提示
+
 两种模式（可全局切换）：
   - 审查模式（默认）：生成 SQL → 展示给用户确认 → 确认后执行
   - 快速模式：生成 SQL 后直接执行，跳过确认
-
-状态机（审查模式才用到）：
-  idle → wait_confirm → (确认) → idle
-                      → (修改) → wait_confirm
-                      → (取消) → idle
 """
 import json
 import logging
 import os
+import threading
+import time
 from typing import Dict
 
 from .feishu_client import FeishuClient
-from .llm_client import LLMClient
+from .cursor_client import CursorClient
 from .sql_executor import SQLExecutor
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,6 @@ HELP_KEYWORDS    = {"帮助", "help", "用法", "使用说明"}
 FAST_PREFIXES    = ("直接跑", "直接执行", "直接出数", "跳过确认")
 MODIFY_PREFIXES  = ("修改", "改一下", "帮我改", "修改意见", "修改建议", "调整", "需要改")
 
-# 快速模式开关关键词
 FAST_MODE_ON_KEYWORDS  = {"快速模式", "不需要确认", "不用确认", "不需要sql", "不用sql",
                            "跳过sql", "直接出数模式", "快速出数"}
 FAST_MODE_OFF_KEYWORDS = {"审查模式", "需要确认", "看sql", "要确认sql", "恢复确认"}
@@ -58,18 +59,19 @@ class Workflow:
     def __init__(
         self,
         feishu: FeishuClient,
-        llm: LLMClient,
+        cursor_client: CursorClient,
         executor: SQLExecutor,
         config: dict,
     ):
-        self.feishu   = feishu
-        self.llm      = llm
+        self.feishu = feishu
+        self.cursor_client = cursor_client
         self.executor = executor
-        self.output_dir    = config.get("output_dir", "../output")
+        self.output_dir = config.get("output_dir", "../output")
         self.data_threshold = config.get("data_threshold", 20)
         self.sessions: Dict[str, dict] = {}
-        # 用户级快速模式开关（key=user_id, value=bool）
         self.fast_mode_users: Dict[str, bool] = {}
+
+        self._progress_interval = 15
 
     # ── 主入口 ────────────────────────────────────────────
 
@@ -80,7 +82,6 @@ class Workflow:
             self.feishu.send_text(chat_id, HELP_TEXT)
             return
 
-        # ── 快速模式全局开关 ─────────────────────────────
         if text in FAST_MODE_ON_KEYWORDS:
             self.fast_mode_users[user_id] = True
             self.feishu.send_text(chat_id,
@@ -95,11 +96,9 @@ class Workflow:
 
         session = self.sessions.get(user_id)
 
-        # ── 审查模式：等待确认中 / 执行中 ──────────────────────────
         if session:
             state = session.get("state")
             if state == "executing":
-                # SQL 正在执行，告知用户等待，不要重复触发
                 self.feishu.send_text(chat_id, "⏳ SQL 正在执行中，请稍候，不要重复发送...")
                 return
             if state == "wait_confirm":
@@ -111,7 +110,6 @@ class Workflow:
                     self._modify(user_id, chat_id, text, session)
                 return
 
-        # ── 无活跃会话时的关键词拦截 ─────────────────────
         if text in CONFIRM_KEYWORDS:
             self.feishu.send_text(chat_id, "⚠️ 没有待确认的查询，请直接发送数据需求。")
             return
@@ -122,7 +120,6 @@ class Workflow:
             self.feishu.send_text(chat_id, "⚠️ 没有待修改的查询，请重新发送完整的数据需求。")
             return
 
-        # ── 快速执行入口（加「直接跑：」前缀跳过确认）───────
         for prefix in FAST_PREFIXES:
             if text.startswith(prefix):
                 requirement = text[len(prefix):].lstrip("：: ").strip()
@@ -132,7 +129,6 @@ class Workflow:
                     self.feishu.send_text(chat_id, "请在前缀后面描述您的需求。")
                 return
 
-        # ── 默认路由：按用户模式决定走快速还是审查 ────────
         if self.fast_mode_users.get(user_id):
             self._fast_mode(user_id, chat_id, text)
         else:
@@ -143,25 +139,31 @@ class Workflow:
     def _fast_mode(self, user_id: str, chat_id: str, text: str):
         self.feishu.send_text(chat_id, "⏳ 正在生成并执行查询...")
 
-        # 带入上一次的对话历史，让 LLM 能理解「加上团队名称」「改成上个月」这类修改
+        # 并行预热 SSH 隧道（SQL 生成期间提前建连）
+        tunnel_thread = threading.Thread(target=self._safe_ensure_tunnel, daemon=True)
+        tunnel_thread.start()
+
         history = self.sessions.get(user_id, {}).get("history")
         if history:
             history = list(history) + [{"role": "user", "content": text}]
-        result = self.llm.generate_sql(text, history)
+
+        progress_cb = self._make_progress_callback(chat_id)
+        result = self.cursor_client.generate_sql(text, history, on_progress=progress_cb)
 
         if not result.get("sql"):
             msg = result.get("understanding", "需求理解失败，请更详细地描述您的数据需求。")
             self.feishu.send_text(chat_id, f"❓ {msg}")
             return
 
-        # 执行完后把历史保存下来，供下一次修改使用
         prev_history = history or []
         new_history = prev_history if history else [{"role": "user", "content": text}]
         new_history = new_history + [
             {"role": "assistant", "content": json.dumps(result, ensure_ascii=False)}
         ]
-        # 只保留最近 6 次查询（每次 = 用户消息 + AI 回复，共 12 条），避免上下文过长拖慢速度
         self.sessions[user_id] = {"state": "done", "history": new_history[-12:]}
+
+        # 等待隧道预热完成
+        tunnel_thread.join(timeout=10)
 
         logger.info("快速模式 SQL 生成完成，直接执行")
         self._run_and_reply(chat_id, result["sql"], result.get("filename", "查询结果.xlsx"))
@@ -171,7 +173,12 @@ class Workflow:
     def _review_mode(self, user_id: str, chat_id: str, text: str):
         self.feishu.send_text(chat_id, "⏳ 正在生成 SQL，请稍候...")
 
-        result = self.llm.generate_sql(text)
+        # 审查模式也预热隧道，这样确认后执行更快
+        tunnel_thread = threading.Thread(target=self._safe_ensure_tunnel, daemon=True)
+        tunnel_thread.start()
+
+        progress_cb = self._make_progress_callback(chat_id)
+        result = self.cursor_client.generate_sql(text, on_progress=progress_cb)
 
         if not result.get("sql"):
             msg = result.get("understanding", "需求理解失败，请更详细地描述您的数据需求。")
@@ -179,10 +186,10 @@ class Workflow:
             return
 
         self.sessions[user_id] = {
-            "state":       "wait_confirm",
-            "chat_id":     chat_id,
-            "sql":         result["sql"],
-            "filename":    result.get("filename", "查询结果.xlsx"),
+            "state":         "wait_confirm",
+            "chat_id":       chat_id,
+            "sql":           result["sql"],
+            "filename":      result.get("filename", "查询结果.xlsx"),
             "output_fields": result.get("output_fields", []),
             "history": [
                 {"role": "user",      "content": text},
@@ -199,7 +206,7 @@ class Workflow:
         history = list(session.get("history", []))
         history.append({"role": "user", "content": text})
 
-        result = self.llm.generate_sql(text, history)
+        result = self.cursor_client.generate_sql(text, history)
 
         if not result.get("sql"):
             self.feishu.send_text(chat_id, f"❓ {result.get('understanding', '修改失败，请再描述一下。')}")
@@ -222,7 +229,6 @@ class Workflow:
         if success:
             self.sessions.pop(user_id, None)
         else:
-            # SQL 执行失败，保留会话让用户可以重试「确认」或修改 SQL
             session["state"] = "wait_confirm"
 
     # ── 取消 ─────────────────────────────────────────────
@@ -231,11 +237,10 @@ class Workflow:
         self.sessions.pop(user_id, None)
         self.feishu.send_text(chat_id, "✅ 已取消。")
 
-    # ── SQL 执行 + 结果返回（快速/审查共用）─────────────
+    # ── SQL 执行 + 结果返回 ──────────────────────────────
 
     def _run_and_reply(self, chat_id: str, sql: str, filename: str) -> bool:
-        """执行 SQL 并回复结果。返回 True 表示成功，False 表示失败。"""
-        self.feishu.send_text(chat_id, "⏳ 正在通过跳板机执行 SQL，请稍候...")
+        self.feishu.send_text(chat_id, "⏳ 正在执行 SQL...")
         try:
             df = self.executor.execute(sql)
         except Exception as e:
@@ -259,7 +264,30 @@ class Workflow:
             self.feishu.send_file(chat_id, filepath, filename)
         return True
 
-    # ── 审查模式确认消息 ──────────────────────────────────
+    # ── 辅助 ─────────────────────────────────────────────
+
+    def _safe_ensure_tunnel(self):
+        """安全预热 SSH 隧道，不抛异常（后台线程调用）。"""
+        try:
+            self.executor.ensure_tunnel()
+        except Exception as e:
+            logger.warning("SSH 隧道预热失败（不影响后续重试）: %s", e)
+
+    def _make_progress_callback(self, chat_id: str):
+        """
+        创建节流进度回调：每 _progress_interval 秒最多发一次进度消息，
+        避免刷屏又让用户知道还在处理。
+        """
+        state = {"last_notify": time.time(), "notified": False}
+
+        def _cb(line: str):
+            now = time.time()
+            if now - state["last_notify"] >= self._progress_interval and not state["notified"]:
+                self.feishu.send_text(chat_id, "⏳ Cursor 仍在处理中...")
+                state["last_notify"] = now
+                state["notified"] = True
+
+        return _cb
 
     def _send_confirmation(self, chat_id: str, result: dict, modified: bool = False):
         title  = "📋 SQL（已修改）" if modified else "📋 SQL 预览"

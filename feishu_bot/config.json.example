@@ -4,16 +4,12 @@
     "app_secret": "请填写飞书应用的 App Secret"
   },
 
-  "llm": {
-    "_说明": "provider 二选一: anthropic (Claude) 或 openai_compatible (DeepSeek等)",
-
-    "provider": "anthropic",
-    "api_key": "sk-ant-xxxxxxxxxxxxxxxx",
-    "model": "claude-sonnet-4-20250514",
-
-    "_provider_deekseek示例": "openai_compatible",
-    "_base_url_deepseek示例": "https://api.deepseek.com",
-    "_model_deepseek示例": "deepseek-chat"
+  "cursor": {
+    "_说明": "使用 Cursor CLI 无头模式生成 SQL，需先安装 Cursor CLI 并登录",
+    "api_key": "",
+    "model": "",
+    "workspace": "",
+    "timeout": 180
   },
 
   "database": {
@@ -27,8 +23,6 @@
     "database": "tmp"
   },
 
-  "knowledge_dir": "../.cursor/knowledge",
-  "table_schema_dir": "../code/sql/表结构",
   "output_dir": "../output",
   "data_threshold": 20
 }

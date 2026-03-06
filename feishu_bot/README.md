@@ -7,13 +7,14 @@
 ```
 用户在飞书聊天发消息
   → 飞书 WebSocket 长连接推送到本地
-  → LLM (Claude / DeepSeek) 理解需求 + 生成 SQL
+  → Cursor CLI 无头模式（读取工作区知识库 + 规则，生成 SQL）
   → SSH 隧道连接跳板机执行 SQL
   → 数据量小：直接展示（可复制）
   → 数据量大：生成 Excel 文件发送
 ```
 
 **无需服务器、无需公网 IP**，本地电脑运行即可。
+SQL 生成由 Cursor CLI 完成，自动使用工作区中的知识库、规则和表结构定义。
 
 ---
 
@@ -37,21 +38,29 @@
    - 让你们公司的飞书管理员审核通过即可
    - 审核通过后，在飞书里搜索你的机器人名字，就能找到它了
 
-### 第二步：获取 LLM API Key（二选一）
+### 第二步：安装 Cursor CLI
 
-#### 方案 A：Anthropic Claude（和 Cursor 里用的同款模型）
+SQL 生成使用 Cursor 无头模式，需要先安装 Cursor CLI：
 
-1. 打开 [Anthropic Console](https://console.anthropic.com)，注册账号
-2. 进入 **「API Keys」** 页面，点击 **「Create Key」**，复制保存（只显示一次！）
-3. 在 **「Plans & Billing」** 页面绑定信用卡并充值（$5 起）
-4. 推荐模型：**Claude Sonnet**（每次约 ¥0.3，SQL 生成完全够用）
+**Windows（PowerShell）：**
+```powershell
+irm 'https://cursor.com/install?win32=true' | iex
+```
 
-#### 方案 B：DeepSeek（性价比最高，推荐）
+安装完成后登录：
+```powershell
+agent login
+```
 
-1. 打开 [DeepSeek 开放平台](https://platform.deepseek.com)，注册账号
-2. 登录后在左侧找到 **「API Keys」**
-3. 点击 **「创建 API Key」**，复制并保存（只显示一次！）
-4. 在 **「充值」** 页面充值 ¥10（每次约 ¥0.01，够用几个月）
+或者设置 API Key 环境变量（从 [Cursor 设置页](https://cursor.com/settings) 获取）：
+```powershell
+$env:CURSOR_API_KEY = "your_api_key_here"
+```
+
+验证安装：
+```powershell
+agent --version
+```
 
 ### 第三步：安装 Python 依赖
 
@@ -67,28 +76,15 @@ pip install -r requirements.txt
 copy config.json.example config.json
 ```
 
-编辑 `config.json`，填入你获取的信息。`llm` 部分根据你选的方案填：
+编辑 `config.json`，填入你获取的信息：
 
-**方案 A — Claude：**
-```json
-"llm": {
-  "provider": "anthropic",
-  "api_key": "sk-ant-xxxxx（Anthropic 控制台复制的 Key）",
-  "model": "claude-sonnet-4-20250514"
-}
-```
-
-**方案 B — DeepSeek：**
-```json
-"llm": {
-  "provider": "openai_compatible",
-  "api_key": "sk-xxxxx（DeepSeek 控制台复制的 Key）",
-  "base_url": "https://api.deepseek.com",
-  "model": "deepseek-chat"
-}
-```
-
-> `database` 部分的值和你现有的 `.cursor/skills/jump-sql-excel-export/jump_export_config.json` 完全一样，直接抄过来即可。
+- **feishu**：飞书应用的 App ID 和 App Secret
+- **cursor**：Cursor CLI 配置（通常留空即可，会使用默认值）
+  - `api_key`：留空则使用 `CURSOR_API_KEY` 环境变量或已登录的账号
+  - `model`：留空则使用 Cursor 默认模型
+  - `workspace`：留空则自动使用 bi-assistant 工作区根目录
+  - `timeout`：CLI 超时时间（秒），默认 180
+- **database**：跳板机和数据库连接信息（和 `.cursor/skills/jump-sql-excel-export/jump_export_config.json` 一致）
 
 ---
 
@@ -126,6 +122,7 @@ python main.py
 
 - 机器人只在你的电脑运行时在线（本地运行，非服务器部署）
 - 需要连接公司 VPN 才能执行 SQL（和 Cursor 里跑一样）
+- SQL 生成通过 Cursor CLI 完成，使用你的 Cursor 订阅额度
 - SQL 执行可能需要几十秒，请耐心等待
 - `config.json` 包含敏感信息，不要提交到 Git
 
@@ -142,7 +139,7 @@ feishu_bot/
 ├── README.md               # 本文件
 └── core/
     ├── feishu_client.py    # 飞书 API（发消息、传文件）
-    ├── llm_client.py       # LLM 集成（Claude / DeepSeek，需求理解 + SQL 生成）
+    ├── cursor_client.py    # Cursor CLI 无头模式（知识库 + 规则 → SQL 生成）
     ├── sql_executor.py     # SQL 执行（SSH 隧道 + Spark SQL）
     └── workflow.py         # 工作流编排（会话状态管理）
 ```
