@@ -46,9 +46,60 @@ select
   ,cd.regiment_name
   ,cd.team_name
 
-  ,nullif(concat_ws('|', collect_list(o.good_name)), '') as good_name
-  ,sum(o.amount) as amount
-  ,nullif(concat_ws('|', collect_list(substr(cast(o.pay_time as string), 1, 19))), '') as pay_time
+  ,nullif(concat_ws('|', collect_list(
+    case when unix_timestamp(o.pay_time) - unix_timestamp(cd.call_start_time) <= 24 * 3600
+    then o.good_name end
+  )), '') as good_name_24h
+  ,sum(case when unix_timestamp(o.pay_time) - unix_timestamp(cd.call_start_time) <= 24 * 3600
+    then o.amount end) as amount_24h
+  ,nullif(concat_ws('|', collect_list(
+    case when unix_timestamp(o.pay_time) - unix_timestamp(cd.call_start_time) <= 24 * 3600
+    then substr(cast(o.pay_time as string), 1, 19) end
+  )), '') as pay_time_24h
+
+  ,nullif(concat_ws('|', collect_list(
+    case when unix_timestamp(o.pay_time) - unix_timestamp(cd.call_start_time) <= 48 * 3600
+    then o.good_name end
+  )), '') as good_name_48h
+  ,sum(case when unix_timestamp(o.pay_time) - unix_timestamp(cd.call_start_time) <= 48 * 3600
+    then o.amount end) as amount_48h
+  ,nullif(concat_ws('|', collect_list(
+    case when unix_timestamp(o.pay_time) - unix_timestamp(cd.call_start_time) <= 48 * 3600
+    then substr(cast(o.pay_time as string), 1, 19) end
+  )), '') as pay_time_48h
+
+  ,nullif(concat_ws('|', collect_list(
+    case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 3)
+    then o.good_name end
+  )), '') as good_name_3d
+  ,sum(case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 3)
+    then o.amount end) as amount_3d
+  ,nullif(concat_ws('|', collect_list(
+    case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 3)
+    then substr(cast(o.pay_time as string), 1, 19) end
+  )), '') as pay_time_3d
+
+  ,nullif(concat_ws('|', collect_list(
+    case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 7)
+    then o.good_name end
+  )), '') as good_name_7d
+  ,sum(case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 7)
+    then o.amount end) as amount_7d
+  ,nullif(concat_ws('|', collect_list(
+    case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 7)
+    then substr(cast(o.pay_time as string), 1, 19) end
+  )), '') as pay_time_7d
+
+  ,nullif(concat_ws('|', collect_list(
+    case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 14)
+    then o.good_name end
+  )), '') as good_name_14d
+  ,sum(case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 14)
+    then o.amount end) as amount_14d
+  ,nullif(concat_ws('|', collect_list(
+    case when to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 14)
+    then substr(cast(o.pay_time as string), 1, 19) end
+  )), '') as pay_time_14d
 
 from call_detail cd
 left join aws.crm_order_info o
@@ -57,8 +108,7 @@ left join aws.crm_order_info o
   and o.good_kind_name_level_2 = '组合商品'
   and o.status = '支付成功'
   and o.pay_time >= cd.call_start_time
-  and to_date(o.pay_time) >= '2026-03-02'
-  and to_date(o.pay_time) <= '2026-03-08'
+  and to_date(o.pay_time) <= date_add(to_date(cd.call_start_time), 14)
 group by
   cd.action_id
   ,cd.user_id

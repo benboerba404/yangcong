@@ -178,7 +178,7 @@ class CursorClient:
             f.write(prompt)
 
         cmd = self._build_cmd()
-        cmd.extend(["-p", "--output-format", "text", "--trust", "--mode", "ask"])
+        cmd.extend(["-p", "--output-format", "stream-json", "--trust"])
 
         if self.workspace:
             cmd.extend(["--workspace", self.workspace])
@@ -192,7 +192,7 @@ class CursorClient:
         if self.api_key:
             env["CURSOR_API_KEY"] = self.api_key
 
-        logger.info("调用 Cursor CLI (streaming, workspace=%s)...", self.workspace)
+        logger.info("调用 Cursor CLI (agent mode, workspace=%s)...", self.workspace)
         start_ts = time.time()
 
         proc = subprocess.Popen(
@@ -205,12 +205,11 @@ class CursorClient:
         if proc_ref is not None:
             proc_ref.proc = proc
 
-        output_chunks: list[str] = []
+        result_text = ""
+        got_result = False
         last_activity = time.time()
-        timed_out = False
 
         def _read_stderr():
-            """后台线程消费 stderr，防止管道满阻塞。"""
             try:
                 proc.stderr.read()
             except Exception:
@@ -221,13 +220,10 @@ class CursorClient:
 
         try:
             while True:
-                # 检查总超时
                 if time.time() - start_ts > self.timeout:
-                    timed_out = True
                     proc.kill()
                     raise subprocess.TimeoutExpired(cmd, self.timeout)
 
-                # 检查活动超时（连续无输出）
                 if time.time() - last_activity > self.idle_timeout:
                     proc.kill()
                     raise _IdleTimeoutError(self.idle_timeout)
@@ -239,38 +235,55 @@ class CursorClient:
                     time.sleep(0.1)
                     continue
 
-                line = _decode_output(line_bytes)
-                output_chunks.append(line)
                 last_activity = time.time()
+                line = _decode_output(line_bytes).strip()
+                if not line:
+                    continue
 
-                if on_progress and line.strip():
-                    on_progress(line.strip())
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                if event_type == "result":
+                    result_text = event.get("result", "")
+                    got_result = True
+                    logger.info("收到 result 事件 (%.1fs)", time.time() - start_ts)
+                    break
+
+                if on_progress and event_type == "assistant":
+                    content = event.get("message", {}).get("content", [])
+                    for part in content:
+                        text = part.get("text", "").strip()
+                        if text:
+                            on_progress(text[:100])
 
         except (subprocess.TimeoutExpired, _IdleTimeoutError):
             proc.kill()
             raise
         finally:
-            proc.wait(timeout=5)
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
             stderr_thread.join(timeout=3)
 
         elapsed = time.time() - start_ts
-        full_output = "".join(output_chunks).strip()
 
-        if proc.returncode != 0:
-            stderr_text = ""
-            try:
-                raw_err = proc.stderr.read()
-                if raw_err:
-                    stderr_text = _decode_output(raw_err)[:500]
-            except Exception:
-                pass
-            raise RuntimeError(f"Cursor CLI 退出码 {proc.returncode}: {stderr_text}")
+        if not got_result:
+            if proc.returncode != 0:
+                raise RuntimeError(f"Cursor CLI 退出码 {proc.returncode}")
+            raise RuntimeError("Cursor CLI 未返回 result 事件")
 
-        if not full_output:
+        if not result_text:
             raise RuntimeError("Cursor CLI 返回空结果")
 
-        logger.info("Cursor CLI 返回 %d 字符 (%.1fs)", len(full_output), elapsed)
-        return full_output
+        logger.info("Cursor CLI 返回 %d 字符 (%.1fs)", len(result_text), elapsed)
+        return result_text
 
 
 class _IdleTimeoutError(Exception):

@@ -14,16 +14,9 @@ col_map = {
     'agent_name': '坐席名称',
     'regiment_name': '团',
     'team_name': '组',
-    'good_name_24h': '24小时内转化商品名称',
-    'amount_24h': '24小时内转化金额',
-    'good_name_48h': '48小时内转化商品名称',
-    'amount_48h': '48小时内转化金额',
-    'good_name_3d': '3天内转化商品名称',
-    'amount_3d': '3天内转化金额',
-    'good_name_7d': '7天内转化商品名称',
-    'amount_7d': '7天内转化金额',
-    'good_name_14d': '14天内转化商品名称',
-    'amount_14d': '14天内转化金额',
+    'good_name': '转化商品名称(0302-0308)',
+    'amount': '转化金额(0302-0308)',
+    'pay_time': '转化时间(0302-0308)',
 }
 
 df.rename(columns=col_map, inplace=True)
@@ -33,9 +26,8 @@ print("Done. Shape:", df.shape)
 print("Columns:", list(df.columns))
 print("\nPhone sample (first 5):")
 print(df['手机号'].head())
-print("\nConversion stats:")
-for w in ['24小时', '48小时', '3天', '7天', '14天']:
-    col = f'{w}内转化商品名称'
-    if col in df.columns:
-        cnt = df[col].notna().sum()
-        print(f"  {w}: {cnt} rows with conversion")
+conv_col = '转化商品名称(0302-0308)'
+cnt = df[conv_col].notna().sum()
+print(f"\nConversion: {cnt} / {len(df)} rows have conversion")
+print("\nSample rows with conversion:")
+print(df[df[conv_col].notna()][['通话时间', '转化商品名称(0302-0308)', '转化金额(0302-0308)', '转化时间(0302-0308)']].head(3))
