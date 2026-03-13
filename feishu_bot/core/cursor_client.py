@@ -58,11 +58,37 @@ def _find_agent_cmd() -> str:
 
 OUTPUT_FORMAT_INSTRUCTION = (
     "\n\n---\n"
+    "## 工作流（必须严格遵循）\n\n"
+    "### Step 1: 检索可复用 SQL\n"
+    "动手写之前**先找现成的**：\n"
+    "1. 读取 `.cursor/knowledge/sql-patterns.md`，检查是否有匹配场景的标准模板\n"
+    "2. 使用 Glob 搜索 `code/sql/**/*.sql`，根据文件名匹配相似需求\n"
+    "找到可复用 SQL 后直接复用或微调，不必从零编写。\n\n"
+    "### Step 2: 查阅知识库\n"
+    "编写/复用 SQL 前**必须**按需查阅以下文件：\n"
+    "| 查什么 | 文件 |\n"
+    "|--------|------|\n"
+    "| 目标表必加的 WHERE 条件 | `.cursor/knowledge/default-filters.md`（必查） |\n"
+    "| 术语定义和计算口径 | `.cursor/knowledge/glossary.md`（必查） |\n"
+    "| 字段枚举值 | `.cursor/knowledge/enums.md` |\n"
+    "| 多表 JOIN 方式 | `.cursor/knowledge/table-relations.md` |\n"
+    "| 表字段和粒度 | `.cursor/knowledge/table-schemas.md` |\n"
+    "| 完整 DDL | `code/sql/表结构/*.sql` |\n\n"
+    "### Step 3: 编写 SQL\n"
+    "SQL 编写规范（Spark SQL 3.3.3）：\n"
+    "- 禁止 select *，必须列出具体字段\n"
+    "- 强制 CTE（with ... as），禁止多层嵌套子查询\n"
+    "- 关键字小写（select/from/where/group by）\n"
+    "- 中文别名用反引号（as `中文名`）\n"
+    "- 末尾必须加 limit 100000\n"
+    "- 领取转化率必须使用日报口径（→ .cursor/rules/conversion-calc-convention.mdc）\n\n"
+    "### Step 4: 输出 JSON\n"
     "请以 JSON 格式回复，包含以下字段：\n"
-    '{"understanding": "对需求的理解", "sql": "完整SQL", '
+    '{"understanding": "对需求的理解（1-3句话）", "sql": "完整可执行SQL", '
     '"output_fields": ["字段1"], "estimated_rows": "少量/中等/大量", '
-    '"filename": "文件名.xlsx"}\n'
-    "如果需求不明确，sql 设为空字符串。只输出 JSON，不要有其他文字。"
+    '"filename": "建议文件名.xlsx"}\n'
+    "如果需求不明确，在 understanding 中说明缺少什么，sql 设为空字符串。\n"
+    "只输出 JSON，不要有其他文字。"
 )
 
 

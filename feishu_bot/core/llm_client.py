@@ -21,14 +21,28 @@ SYSTEM_PROMPT_TEMPLATE = """\
 
 ## 你的知识库
 
-### 业务术语与指标定义
+以下知识库按模块组织，写 SQL 时务必严格遵守其中的口径和规则。
+
+### 一、业务术语与指标定义（glossary）
 {glossary}
 
-### 数据表关系
+### 二、默认筛选条件与通用规则（default-filters）
+{default_filters}
+
+### 三、枚举值字典（enums）
+{enums}
+
+### 四、数据表关系（table-relations）
 {table_relations}
 
-### 表结构定义
-{table_schemas}
+### 五、表结构元数据（table-schemas）
+{table_schemas_overview}
+
+### 六、标准 SQL 模板（sql-patterns）
+{sql_patterns}
+
+### 七、表结构 DDL（参考）
+{table_schemas_ddl}
 
 ## SQL 编写规范（Spark SQL 3.3.3）
 
@@ -40,41 +54,6 @@ SYSTEM_PROMPT_TEMPLATE = """\
 6. 输出字段中文别名用反引号包裹（如 as `中文名`）
 7. 日期格式统一处理为 'yyyy-MM-dd'
 8. 关键字小写（select、from、where、group by 等）
-
-## 领取转化率特殊口径
-
-涉及领取转化率时，除非用户明确要求去重口径，一律采用"日报口径"两步聚合法：
-1. 内层 GROUP BY：按日报粒度（领取日期 + worker_id + 用户类型 + 付费状态 + \
-线索阶段 + 线索等级 + 线索来源 + 线索来源一级 + 新老人 + 职场 + 部门 + 团 + 小组），\
-做 COUNT DISTINCT / SUM
-2. 外层：按用户需求维度用 SUM 汇总到目标粒度
-
-## 关键维度字段说明（容易出错）
-
-### 组织架构名称
-- `regiment_name`（团名称）、`team_name`（小组名称）、`department_name`（学部）、`workplace_name`（职场）  
-  ⚠️ 这些字段**不在** `aws.clue_info` 或 `aws.crm_order_info` 里！必须 JOIN `dw.dim_crm_organization`：
-  ```sql
-  left join dw.dim_crm_organization d2 on t.regiment_id = d2.id  -- 取 d2.regiment_name
-  left join dw.dim_crm_organization d4 on t.team_id     = d4.id  -- 取 d4.team_name
-  ```
-
-### 线索来源名称
-- `clue_source_name`、`clue_source_name_level_1`  
-  ⚠️ 这两个字段**不在** `aws.clue_info` 里！需要 JOIN 维表：
-  ```sql
-  left join tmp.wuhan_clue_soure_name b on a.clue_source = b.clue_source
-  ```
-
-### 新老人标识
-- `worker`（新人/老人）是**计算字段**，不是表里的列，需按以下逻辑计算：
-  ```sql
-  case when substr(worker_join_at,1,10) = TRUNC(worker_join_at,'month')
-            and substr(worker_join_at,1,10) < add_months(substr(a.created_at,1,7),-2) then '老人'
-       when substr(worker_join_at,1,10) > TRUNC(worker_join_at,'month')
-            and substr(worker_join_at,1,10) < add_months(substr(a.created_at,1,7),-3) then '老人'
-       else '新人' end as worker
-  ```
 
 ## events.frontend_event_orc 表特殊约束
 
@@ -117,25 +96,34 @@ class LLMClient:
         # openai_compatible 不在 __init__ 里预建 client，改为每次调用时新建
 
     def load_knowledge(self, knowledge_dir: str, schema_dir: str):
-        # 词汇表全量加载（Claude Sonnet 200K context，完全容得下）
         glossary = _read_file(os.path.join(knowledge_dir, "glossary.md"))
+        default_filters = _read_file(os.path.join(knowledge_dir, "default-filters.md"))
+        enums = _read_file(os.path.join(knowledge_dir, "enums.md"))
         table_relations = _read_file(os.path.join(knowledge_dir, "table-relations.md"))
+        table_schemas_overview = _read_file(os.path.join(knowledge_dir, "table-schemas.md"))
+        sql_patterns = _read_file(os.path.join(knowledge_dir, "sql-patterns.md"))
 
-        schemas = []
+        ddl_parts = []
         for sql_file in sorted(glob.glob(os.path.join(schema_dir, "*.sql"))):
             content = _read_file(sql_file)
             if content:
                 name = os.path.basename(sql_file)
-                # 每个表结构截取前 6000 字符，涵盖所有字段定义
-                schemas.append(f"-- {name}\n{content[:6000]}")
-        table_schemas = "\n\n".join(schemas)
+                ddl_parts.append(f"-- {name}\n{content[:6000]}")
+        table_schemas_ddl = "\n\n".join(ddl_parts)
 
         self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             glossary=glossary,
+            default_filters=default_filters,
+            enums=enums,
             table_relations=table_relations,
-            table_schemas=table_schemas,
+            table_schemas_overview=table_schemas_overview,
+            sql_patterns=sql_patterns,
+            table_schemas_ddl=table_schemas_ddl,
         )
-        logger.info("知识库已加载，系统提示词 %d 字符", len(self.system_prompt))
+        logger.info(
+            "知识库已加载（6 模块 + DDL），系统提示词 %d 字符",
+            len(self.system_prompt),
+        )
 
     def generate_sql(self, user_message: str, history: Optional[List[dict]] = None) -> dict:
         """调用 LLM 生成 SQL，失败自动重试最多 3 次，返回结构化结果 dict。"""

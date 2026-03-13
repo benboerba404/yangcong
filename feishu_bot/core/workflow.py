@@ -26,6 +26,9 @@ from .sql_executor import SQLExecutor
 
 logger = logging.getLogger(__name__)
 
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".sessions.json")
+PERSISTABLE_STATES = ("wait_confirm",)
+
 CONFIRM_KEYWORDS = {"确认", "执行", "跑", "ok", "OK", "可以", "没问题", "对", "yes", "Yes", "好"}
 CANCEL_KEYWORDS  = {"取消", "算了", "不用了", "放弃"}
 RESET_KEYWORDS   = {"重置", "重新开始", "清空", "新查询", "重新查询", "reset"}
@@ -76,6 +79,43 @@ class Workflow:
         self.sessions: Dict[str, dict] = {}
         self.fast_mode_users: Dict[str, bool] = {}
         self._req_seq = 0
+        self._load_sessions()
+
+    # ── Session 持久化 ─────────────────────────────────────
+
+    def _load_sessions(self):
+        """启动时从磁盘恢复 wait_confirm 状态的 session，避免重启后用户确认失效。"""
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            restored = 0
+            for user_id, s in saved.items():
+                if s.get("state") in PERSISTABLE_STATES:
+                    self.sessions[user_id] = s
+                    restored += 1
+            if restored:
+                logger.info("从磁盘恢复 %d 个待确认 session", restored)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning("加载 session 文件失败，跳过", exc_info=True)
+
+    def _save_sessions(self):
+        """将所有可持久化的 session 写入磁盘。"""
+        to_save = {}
+        for user_id, s in self.sessions.items():
+            if s.get("state") not in PERSISTABLE_STATES:
+                continue
+            to_save[user_id] = {
+                k: v for k, v in s.items()
+                if k in ("state", "chat_id", "sql", "filename", "output_fields",
+                         "history", "req_id")
+            }
+        try:
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(to_save, f, ensure_ascii=False)
+        except Exception:
+            logger.warning("保存 session 文件失败", exc_info=True)
 
     # ── 请求版本号 ─────────────────────────────────────────
 
@@ -159,12 +199,20 @@ class Workflow:
                 if text.startswith(MODIFY_PREFIXES) or len(text) <= 20:
                     self._modify(user_id, chat_id, text, session)
                     return
-                # 较长文本视为全新需求，自动清掉旧 session
-                self.sessions.pop(user_id, None)
-                logger.info("wait_confirm 状态收到新需求，自动重置 [user=%s]", user_id)
-                # 继续往下走，作为新需求处理
+                # 较长文本——提示用户先处理待确认 SQL，而不是静默丢弃 session
+                logger.info("wait_confirm 状态收到长文本 [user=%s]: %s", user_id, text[:60])
+                self.feishu.send_text(
+                    chat_id,
+                    "⚠️ 你有一条待确认的 SQL 还未处理：\n"
+                    "- 发送「确认」执行\n"
+                    "- 发送「取消」放弃\n"
+                    "- 发送「重置」后再提新需求")
+                return
 
         if text in CONFIRM_KEYWORDS:
+            logger.warning(
+                "用户发送确认但无 session [user=%s] sessions_keys=%s",
+                user_id, list(self.sessions.keys()))
             self.feishu.send_text(chat_id, "⚠️ 没有待确认的查询，请直接发送数据需求。")
             return
         if text in CANCEL_KEYWORDS:
@@ -279,12 +327,14 @@ class Workflow:
             stop_event.set()
 
         if not self._is_current(user_id, req_id):
-            logger.info("审查模式请求 #%d 已过期，放弃", req_id)
+            logger.info("审查模式请求 #%d 已过期，放弃 [user=%s]", req_id, user_id)
             return
 
         if not result.get("sql"):
             self.sessions.pop(user_id, None)
+            self._save_sessions()
             msg = result.get("understanding", "需求理解失败，请更详细地描述您的数据需求。")
+            logger.info("SQL 为空，session 清除 [user=%s] understanding=%s", user_id, msg[:80])
             self.feishu.send_text(chat_id, f"❓ {msg}")
             return
 
@@ -300,6 +350,8 @@ class Workflow:
             "output_fields": result.get("output_fields", []),
             "history":       new_history[-12:],
         }
+        self._save_sessions()
+        logger.info("session → wait_confirm [user=%s req=%d]", user_id, req_id)
         self._send_confirmation(chat_id, result)
 
     # ── 修改（审查模式内）────────────────────────────────
@@ -352,6 +404,7 @@ class Workflow:
             "output_fields": result.get("output_fields", []),
             "history":       history,
         })
+        self._save_sessions()
         self._send_confirmation(chat_id, result, modified=True)
 
     # ── 确认执行（审查模式内）────────────────────────────
@@ -367,7 +420,6 @@ class Workflow:
         if not self._is_current(user_id, req_id):
             return
         if success:
-            # 保留历史，支持多轮对话（"帮我改一下刚才的逻辑"）
             self.sessions[user_id] = {
                 "req_id": req_id, "state": "done",
                 "chat_id": chat_id,
@@ -375,11 +427,13 @@ class Workflow:
             }
         else:
             session["state"] = "wait_confirm"
+        self._save_sessions()
 
     # ── 取消 / 强制重置 ─────────────────────────────────
 
     def _cancel(self, user_id: str, chat_id: str):
         self.sessions.pop(user_id, None)
+        self._save_sessions()
         self.feishu.send_text(chat_id, "✅ 已取消。")
 
     def _force_reset(self, user_id: str, chat_id: str):
@@ -392,6 +446,7 @@ class Workflow:
             ref = session.get("proc_ref")
             if ref:
                 ref.kill()
+        self._save_sessions()
         self.feishu.send_text(chat_id, "✅ 已重置，请直接发送新的数据需求。")
 
     # ── SQL 执行 + 结果返回 ──────────────────────────────

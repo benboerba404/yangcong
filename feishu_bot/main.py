@@ -36,11 +36,14 @@ from core.cursor_client import CursorClient
 from core.sql_executor import SQLExecutor
 from core.workflow import Workflow
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+_log_fmt = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+_log_datefmt = "%Y-%m-%d %H:%M:%S"
+logging.basicConfig(level=logging.INFO, format=_log_fmt, datefmt=_log_datefmt)
+
+_log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+_fh = logging.FileHandler(_log_file, encoding="utf-8")
+_fh.setFormatter(logging.Formatter(_log_fmt, datefmt=_log_datefmt))
+logging.getLogger().addHandler(_fh)
 logger = logging.getLogger("main")
 
 
@@ -60,7 +63,62 @@ class EventDedup:
         return False
 
 
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.pid")
+
+
+def _check_single_instance():
+    """确保只有一个机器人实例在运行，防止多进程抢消息。"""
+    my_pid = os.getpid()
+
+    if os.path.isfile(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            if old_pid != my_pid and _is_process_alive(old_pid):
+                logger.error(
+                    "检测到机器人已在运行 (PID %d)，请勿重复启动！\n"
+                    "如需重启，请先关闭旧终端或运行: taskkill /PID %d /F",
+                    old_pid, old_pid)
+                sys.exit(1)
+        except (ValueError, OSError):
+            pass
+
+    with open(PID_FILE, "w") as f:
+        f.write(str(my_pid))
+    atexit.register(lambda: _remove_pid_file(my_pid))
+    logger.info("单实例检查通过 (PID %d)", my_pid)
+
+
+def _is_process_alive(pid: int) -> bool:
+    """检查指定 PID 的进程是否还在运行（仅限 main.py）。"""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        SYNCHRONIZE = 0x00100000
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _remove_pid_file(my_pid: int):
+    try:
+        if os.path.isfile(PID_FILE):
+            with open(PID_FILE, "r") as f:
+                stored = int(f.read().strip())
+            if stored == my_pid:
+                os.remove(PID_FILE)
+    except Exception:
+        pass
+
+
 def main():
+    # ── 单实例检查 ─────────────────────────────────────────
+    _check_single_instance()
+
     # ── 加载配置 ─────────────────────────────────────────
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, "config.json")
