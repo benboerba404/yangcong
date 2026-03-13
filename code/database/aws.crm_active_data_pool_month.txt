@@ -1,0 +1,159 @@
+package com.onion.etl.aws.crm
+
+import com.onion.etl.util.Constant.getSparkSession
+
+/**
+  * Created by haodong on 2024/11/14 14:32
+  */
+object CrmActiveDataPoolMonth {
+
+  def main(args: Array[String]): Unit = {
+
+    doMain(args)
+  }
+
+  def doMain(args: Array[String]) = {
+
+    val sparkSession = getSparkSession()
+
+    val day = args(0).toInt
+
+    val month = day/100
+
+    sparkSession.sql(
+      s"""
+        |SELECT active_u_user,
+        |       grade,
+        |       mid_stage_name,
+        |       gender,
+        |       active_user_attribution,
+        |       attribution,
+        |       u_from,
+        |       regist_os,
+        |       city_class,
+        |       province,
+        |       province_code,
+        |       city,
+        |       city_code,
+        |       area,
+        |       area_code,
+        |       real_identity,
+        |       row_number() OVER(PARTITION BY active_u_user
+        |                         ORDER BY DAY DESC) end_rk,
+        |                    user_pay_status_statistics,
+        |                    user_pay_status_business,
+        |                    business_user_pay_status_statistics,
+        |                    business_user_pay_status_business,
+        |                    mid_active_type,
+        |                    user_allocation,
+        |                    phone_range,
+        |                    LEVEL,
+        |                    before_sum_amount,
+        |                    row_number() OVER(PARTITION BY active_u_user
+        |                                      ORDER BY DAY) start_rk
+        |FROM aws.crm_active_data_pool_day
+        |WHERE int(DAY/100) = ${month}
+        |""".stripMargin).createOrReplaceTempView("start_end_data")
+
+    sparkSession.sql(
+      s"""
+        |SELECT t1.active_u_user,
+        |       t1.push_u_user,
+        |       t1.enter_datapool_u_user,
+        |       if(array_contains(t6.clue_source, 'mid_school'), t6.u_user, NULL) recieve_u_user,
+        |       t2.grade,
+        |       t2.mid_stage_name,
+        |       t2.gender,
+        |       t2.active_user_attribution,
+        |       t2.attribution,
+        |       t2.u_from,
+        |       t2.regist_os,
+        |       t2.city_class,
+        |       t2.province,
+        |       t2.province_code,
+        |       t2.city,
+        |       t2.city_code,
+        |       t2.area,
+        |       t2.area_code,
+        |       t2.real_identity,
+        |       t3.user_pay_status_statistics,
+        |       t3.user_pay_status_business,
+        |       t3.business_user_pay_status_statistics,
+        |       t3.business_user_pay_status_business,
+        |       t3.mid_active_type,
+        |       t3.user_allocation,
+        |       t3.phone_range,
+        |       t3.LEVEL,
+        |       t1.regist_time,
+        |       t1.user_attribution,
+        |       t1.channel,
+        |       t1.regist_app_version,
+        |       t1.regist_type,
+        |       t1.regist_duration,
+        |       t4.first_deny_reason,
+        |       t4.first_deny_index,
+        |       t5.deny_index_reason_arr,
+        |       t1.push_cnt,
+        |       t1.datepool_cnt,
+        |       t1.all_user_clue_cnt,
+        |       t1.all_add_wechat_cnt,
+        |       t3.before_sum_amount,
+        |       t6.u_user recieve_u_user_all
+        |FROM
+        |  (SELECT active_u_user,
+        |          max(push_u_user) push_u_user,
+        |          max(enter_datapool_u_user) enter_datapool_u_user,
+        |          max(regist_time) regist_time,
+        |          max(user_attribution) user_attribution,
+        |          max(channel) channel,
+        |          max(regist_app_version) regist_app_version,
+        |          max(regist_type) regist_type,
+        |          min(regist_duration) regist_duration,
+        |          sum(push_cnt) push_cnt,
+        |          sum(datepool_cnt) datepool_cnt,
+        |          max(all_user_clue_cnt) all_user_clue_cnt,
+        |          max(all_add_wechat_cnt) all_add_wechat_cnt
+        |   FROM aws.crm_active_data_pool_day
+        |   WHERE int(DAY/100) = ${month}
+        |   GROUP BY active_u_user) t1
+        |LEFT JOIN
+        |  (SELECT *
+        |   FROM start_end_data
+        |   WHERE end_rk = 1) t2 ON t1.active_u_user = t2.active_u_user
+        |LEFT JOIN
+        |  (SELECT *
+        |   FROM start_end_data
+        |   WHERE start_rk = 1) t3 ON t1.active_u_user = t3.active_u_user
+        |LEFT JOIN
+        |  (SELECT user_id,
+        |          coalesce(deny_reason, "") first_deny_reason,
+        |          coalesce(deny_index, 0) first_deny_index,
+        |          row_number() OVER(PARTITION BY user_id
+        |                            ORDER BY created_at) rk
+        |   FROM dw.fact_telesale_clue_day
+        |   WHERE int(DAY/100) = ${month}
+        |   HAVING rk = 1) t4 ON t1.active_u_user = t4.user_id
+        |LEFT JOIN
+        |  (SELECT user_id,
+        |          sort_array(collect_set(deny_index)) deny_index_reason_arr
+        |   FROM dw.fact_telesale_clue_day
+        |   WHERE int(DAY/100) = ${month}
+        |     AND deny_index > 0
+        |   GROUP BY user_id) t5 ON t1.active_u_user = t5.user_id
+        |LEFT JOIN
+        |(SELECT user_id u_user, collect_set(clue_source) clue_source
+        |FROM dw.fact_clue_allocate_info
+        |WHERE int(DAY/100) = ${month}
+        |GROUP BY user_id) t6 ON
+        |t1.active_u_user = t6.u_user
+        |""".stripMargin).createOrReplaceTempView("crm_active_data_pool_month_tmp")
+
+    sparkSession.sql(
+      s"""
+        |INSERT OVERWRITE TABLE aws.crm_active_data_pool_month PARTITION(month = ${month})
+        |SELECT * FROM crm_active_data_pool_month_tmp
+        |""".stripMargin)
+
+    sparkSession.stop()
+  }
+}

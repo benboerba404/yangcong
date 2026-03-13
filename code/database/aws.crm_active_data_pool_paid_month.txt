@@ -1,0 +1,159 @@
+package com.onion.etl.aws.crm
+
+import com.onion.etl.util.Constant.getSparkSession
+import com.onion.etl.util.DateUitil
+import org.apache.spark.sql.SparkSession
+
+/**
+  * Created by haodong on 2025/7/9 14:53
+  */
+object CrmActiveDataPoolPaidMonth {
+
+  def main(args: Array[String]): Unit = {
+
+    val sparkSession = getSparkSession()
+
+    doMain(args, sparkSession)
+
+    sparkSession.stop()
+  }
+
+  def doMain(args: Array[String], sparkSession: SparkSession) = {
+
+    val day = args(0).toInt
+    val dateStr = DateUitil.getMonthDate(day.toString.substring(0, 6))
+    val month_first_day = Integer.parseInt(dateStr(0))
+    val month = day/100
+
+    sparkSession.sql(
+      s"""
+        |WITH orders AS (
+        |  SELECT user_id,
+        |         pay_time,
+        |         amount
+        |  FROM aws.crm_order_info
+        |  WHERE workplace_id IN (4, 400, 702)
+        |    AND regiment_id NOT IN (0, 303, 546)
+        |    AND worker_id <> 0
+        |    AND in_salary = 1
+        |    AND int(date_format(pay_time, 'yyyyMMdd')) BETWEEN ${month_first_day} AND ${day}
+        |),
+        |agg AS (
+        |  SELECT
+        |    a.user_id,
+        |    a.pay_time,
+        |    round(SUM(b.amount), 2) AS amount_after
+        |  FROM orders a
+        |  JOIN orders b
+        |    ON a.user_id = b.user_id AND b.pay_time >= a.pay_time
+        |  GROUP BY a.user_id, a.pay_time
+        |),
+        |result AS (
+        |  SELECT
+        |    user_id,
+        |    collect_list(named_struct('pay_date', pay_time, 'amount_after', amount_after)) AS pay_timeline,
+        |    max(amount_after) amount
+        |  FROM agg
+        |  GROUP BY user_id
+        |)
+        |SELECT * FROM result
+        |""".stripMargin).createOrReplaceTempView("paid_info")
+
+    sparkSession.sql(
+      s"""
+        |
+        |SELECT DISTINCT t2.active_first_date_month,
+        |                t1.user_sk,
+        |                t2.u_user active_u_user,
+        |                t1.grade_name_month,
+        |                t1.stage_name_month,
+        |                t1.user_pay_status_statistics_month,
+        |                t1.user_pay_status_business_month,
+        |                t1.business_user_pay_status_statistics_month,
+        |                t1.business_user_pay_status_business_month,
+        |                if(t3.user_sk IS NOT NULL, 1, 0) is_tele_belong_first_month,
+        |                t2.user_allocation user_allocation_month,
+        |                t4.user_id push_u_user,
+        |                t5.userid enter_datapool_u_user,
+        |                if(t5.userid IS NOT NULL
+        |                   AND t6.is_mid_school = 1, t6.user_id, NULL) recieve_u_user,
+        |                if(t5.userid IS NOT NULL, t6.user_id, NULL) recieve_u_user_all,
+        |                t6.user_id active_recieve_u_user_all,
+        |                if(t5.userid IS NULL, t7.deny_reason, NULL) first_deny_reason,
+        |                if(t5.userid IS NULL, t7.deny_index, NULL) first_deny_index,
+        |                if(t5.userid IS NOT NULL
+        |                   AND t6.is_mid_school = 1
+        |                   AND array_sort(filter(t8.pay_timeline, x -> x.pay_date > t6.mid_recieve_time))[0].amount_after IS NOT NULL, t8.user_id, NULL) recieve_paid_u_user,
+        |                if(t5.userid IS NOT NULL
+        |                   AND t6.is_mid_school = 1, array_sort(filter(t8.pay_timeline, x -> x.pay_date > t6.mid_recieve_time))[0].amount_after, NULL) recieve_paid_amount,
+        |                if(t5.userid IS NOT NULL
+        |                   AND t6.user_id IS NOT NULL
+        |                   AND array_sort(filter(t8.pay_timeline, x -> x.pay_date > t6.recieve_time))[0].amount_after IS NOT NULL, t8.user_id, NULL) recieve_all_paid_u_user,
+        |                if(t5.userid IS NOT NULL
+        |                   AND t6.user_id IS NOT NULL, array_sort(filter(t8.pay_timeline, x -> x.pay_date > t6.recieve_time))[0].amount_after, NULL) recieve_all_paid_amount,
+        |                t8.user_id active_paid_u_user_all,
+        |                t8.amount active_paid_amount_all
+        |FROM
+        |  (SELECT user_sk,
+        |          grade_name_month,
+        |          stage_name_month,
+        |          user_pay_status_statistics_month,
+        |          user_pay_status_business_month,
+        |          business_user_pay_status_statistics_month,
+        |          business_user_pay_status_business_month,
+        |          int(month_first_day/100) MONTH,
+        |          row_number() OVER (PARTITION BY user_sk
+        |                             ORDER BY DAY) rk
+        |   FROM aws.business_active_user_last_14_day
+        |   WHERE DAY BETWEEN ${month_first_day} AND ${day}
+        |   HAVING rk = 1) t1
+        |INNER JOIN
+        |  (SELECT user_sk,
+        |          u_user,
+        |          user_allocation,
+        |          day,
+        |          to_date(day, 'yyyyMMdd') active_first_date_month,
+        |          row_number() OVER (PARTITION BY user_sk
+        |                             ORDER BY DAY) rk
+        |   FROM dws.topic_user_active_detail_day
+        |   WHERE DAY BETWEEN ${month_first_day} AND ${day}
+        |   HAVING rk = 1) t2 ON t1.user_sk = t2.user_sk
+        |LEFT JOIN aws.clue_info t3 ON t2.day BETWEEN t3.created_sk AND int(date_format(t3.clue_expire_time, "yyyyMMdd"))
+        |AND t2.user_sk = t3.user_sk
+        |LEFT JOIN
+        |  (SELECT user_id
+        |   FROM ods_rt.telesale_clue_rt
+        |   WHERE DAY BETWEEN ${month_first_day} AND ${day}
+        |   GROUP BY user_id) t4 ON t2.u_user = t4.user_id
+        |LEFT JOIN
+        |  (SELECT userid
+        |   FROM crm.info_produce_log_all
+        |   WHERE DAY BETWEEN ${month_first_day} AND ${day}
+        |   GROUP BY userid) t5 ON t4.user_id = t5.userid
+        |LEFT JOIN
+        |  (SELECT user_id,
+        |          max(if(clue_source = 'mid_school', 1, 0)) is_mid_school,
+        |          min(if(clue_source = 'mid_school', created_at, NULL)) mid_recieve_time,
+        |          min(created_at) recieve_time
+        |   FROM aws.clue_info
+        |   WHERE created_sk BETWEEN ${month_first_day} AND ${day}
+        |   GROUP BY user_id) t6 ON t2.u_user = t6.user_id
+        |LEFT JOIN
+        |  (SELECT user_id,
+        |          deny_reason,
+        |          deny_index,
+        |          row_number() OVER (PARTITION BY user_id
+        |                             ORDER BY created_at) rk
+        |   FROM ods_rt.telesale_clue_rt
+        |   WHERE DAY BETWEEN ${month_first_day} AND ${day}
+        |   HAVING rk = 1) t7 ON t2.u_user = t7.user_id
+        |LEFT JOIN paid_info t8 ON t2.u_user = t8.user_id
+        |""".stripMargin).createOrReplaceTempView("crm_active_data_pool_paid_month")
+
+    sparkSession.sql(
+      s"""
+        |INSERT overwrite TABLE aws.crm_active_data_pool_paid_month partition(month = ${month})
+        |SELECT * FROM crm_active_data_pool_paid_month
+        |""".stripMargin)
+  }
+}

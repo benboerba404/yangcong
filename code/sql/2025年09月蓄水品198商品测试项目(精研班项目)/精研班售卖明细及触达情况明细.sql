@@ -11,7 +11,7 @@ WITH sale AS (
   FROM tmp.lidanping_quanyu_198test_2_goodtype
   WHERE channel = 'C端'
     AND good_type = '线索品198'
-    AND SUBSTR(paid_time, 1, 10) >= '2026-02-09' and SUBSTR(paid_time, 1, 10) <= '2026-03-01'
+    AND SUBSTR(paid_time, 1, 10) >= '2026-02-09' and SUBSTR(paid_time, 1, 10) <= '2026-03-08'
 )
 
 , touch AS (
@@ -27,7 +27,7 @@ WITH sale AS (
     regiment_id,
     team_id
   FROM aws.clue_info
-  WHERE SUBSTR(clue_expire_time, 1, 10) >= '2026-02-09' and SUBSTR(created_at, 1, 10) <= '2026-03-01'
+  WHERE SUBSTR(clue_expire_time, 1, 10) >= '2026-02-09' and SUBSTR(created_at, 1, 10) <= '2026-03-08'
 )
 
 , conv AS (
@@ -42,7 +42,7 @@ WITH sale AS (
     regiment_id  AS conv_regiment_id,
     team_id      AS conv_team_id
   FROM aws.crm_order_info
-  WHERE SUBSTR(pay_time, 1, 10) >= '2026-02-09' and SUBSTR(pay_time, 1, 10) <= '2026-03-01'
+  WHERE SUBSTR(pay_time, 1, 10) >= '2026-02-09' and SUBSTR(pay_time, 1, 10) <= '2026-03-08'
     AND worker_id <> 0
     AND in_salary = 1
     AND is_test = FALSE
